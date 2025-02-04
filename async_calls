@@ -1,0 +1,167 @@
+import aiohttp
+import asyncio
+import cx_Oracle
+import pandas as pd
+import time
+
+# GitHub API Config
+GITHUB_BASE_URL = "https://your-github-enterprise-instance/api/v3"
+ACCESS_TOKEN = "your_personal_access_token"
+
+# Oracle Database Config
+ORACLE_DSN = cx_Oracle.makedsn("your_host", "your_port", service_name="your_service")
+ORACLE_USER = "your_db_user"
+ORACLE_PASSWORD = "your_db_password"
+
+# API Headers
+HEADERS = {
+    "Authorization": f"token {ACCESS_TOKEN}",
+    "Accept": "application/vnd.github.v3+json"
+}
+
+# Date Range for January 2025
+SINCE_DATE = "2025-01-01T00:00:00Z"
+UNTIL_DATE = "2025-01-31T23:59:59Z"
+
+# Global Rate Limit Tracking
+API_CALL_COUNT = 0
+API_LIMIT = 5000
+API_REMAINING = 5000
+API_RESET_TIME = 0
+
+async def fetch_authors_from_db():
+    """Fetch authors from Oracle database asynchronously."""
+    conn = cx_Oracle.connect(ORACLE_USER, ORACLE_PASSWORD, ORACLE_DSN)
+    cursor = conn.cursor()
+    cursor.execute("SELECT github_username FROM authors_table")  # Update table name
+    authors = [row[0] for row in cursor.fetchall()]
+    cursor.close()
+    conn.close()
+    return authors
+
+async def fetch_rate_limit(session):
+    """Fetch rate limit and update global variables."""
+    global API_LIMIT, API_REMAINING, API_RESET_TIME, API_CALL_COUNT
+    url = f"{GITHUB_BASE_URL}/rate_limit"
+
+    async with session.get(url, headers=HEADERS) as response:
+        API_CALL_COUNT += 1
+        if response.status == 200:
+            data = await response.json()
+            API_LIMIT = data['rate']['limit']
+            API_REMAINING = data['rate']['remaining']
+            API_RESET_TIME = data['rate']['reset']
+            print(f"Rate Limit: {API_REMAINING}/{API_LIMIT}, resets at {API_RESET_TIME}")
+
+async def check_rate_limit(session):
+    """Check and handle API rate limits."""
+    global API_REMAINING, API_RESET_TIME
+    if API_REMAINING <= 100:  # Only check when necessary
+        await fetch_rate_limit(session)
+    
+    if API_REMAINING == 0:
+        wait_time = API_RESET_TIME - int(time.time())
+        print(f"Rate limit reached. Sleeping for {wait_time} seconds...")
+        await asyncio.sleep(wait_time)  # Wait until reset
+        await fetch_rate_limit(session)
+
+async def fetch_repos(session, org):
+    """Fetch repositories from an organization asynchronously."""
+    global API_CALL_COUNT
+    await check_rate_limit(session)
+
+    url = f"{GITHUB_BASE_URL}/orgs/{org}/repos"
+    async with session.get(url, headers=HEADERS) as response:
+        API_CALL_COUNT += 1
+        return await response.json() if response.status == 200 else []
+
+async def fetch_commits(session, owner, repo, author):
+    """Fetch commits for a repository asynchronously."""
+    global API_CALL_COUNT
+    url = f"{GITHUB_BASE_URL}/repos/{owner}/{repo}/commits?author={author}&since={SINCE_DATE}&until={UNTIL_DATE}&per_page=100"
+
+    commits = []
+    page = 1
+
+    while True:
+        await check_rate_limit(session)  # Handle rate limiting
+
+        paginated_url = f"{url}&page={page}"
+        async with session.get(paginated_url, headers=HEADERS) as response:
+            API_CALL_COUNT += 1
+            if response.status == 200:
+                batch = await response.json()
+                if not batch:  # No more commits
+                    break
+                commits.extend(batch)
+                page += 1
+            else:
+                print(f"Error fetching commits for {repo}: {response.status}")
+                break
+
+    return commits
+
+async def store_commits_in_db(commit_data):
+    """Insert commit data into Oracle database asynchronously."""
+    conn = cx_Oracle.connect(ORACLE_USER, ORACLE_PASSWORD, ORACLE_DSN)
+    cursor = conn.cursor()
+
+    sql = """
+    INSERT INTO github_commits (repository, author, commit_sha, message, commit_date)
+    VALUES (:1, :2, :3, :4, :5)
+    """
+    
+    cursor.executemany(sql, commit_data)  # Batch insert
+    conn.commit()
+    cursor.close()
+    conn.close()
+    print(f"Inserted {len(commit_data)} records into the database.")
+
+async def main():
+    """Main function to run all tasks asynchronously."""
+    org = "your_org"
+
+    # Start an async session
+    async with aiohttp.ClientSession() as session:
+        # Fetch authors from DB
+        authors = await fetch_authors_from_db()
+        
+        # Fetch rate limit at start
+        await fetch_rate_limit(session)
+        
+        # Fetch repositories
+        repos = await fetch_repos(session, org)
+
+        commit_tasks = []
+        commit_data = []
+
+        # Fetch commits for each repo and author
+        for repo in repos:
+            repo_name = repo["name"]
+            owner = repo["owner"]["login"]
+
+            for author in authors:
+                print(f"\nFetching commits for author: {author} in repo: {repo_name}")
+                task = fetch_commits(session, owner, repo_name, author)
+                commit_tasks.append(task)
+
+        # Run commit fetch tasks in parallel
+        commit_results = await asyncio.gather(*commit_tasks)
+
+        # Prepare commit data for DB insertion
+        for repo, author, commits in zip(repos, authors, commit_results):
+            for commit in commits:
+                commit_data.append((
+                    repo["name"],
+                    commit['commit']['author']['name'],
+                    commit['sha'],
+                    commit['commit']['message'],
+                    commit['commit']['author']['date']
+                ))
+
+        # Insert into Oracle DB
+        if commit_data:
+            await store_commits_in_db(commit_data)
+
+# Run async event loop
+asyncio.run(main())
